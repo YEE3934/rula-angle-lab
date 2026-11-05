@@ -1,0 +1,11 @@
+﻿sample_id,time_sec,body_side,manual_forearm_deg,manual_neck_deg,baseline_forearm_deg,baseline_neck_deg
+1,1.0,左手側,,,,
+1,1.0,右手側,,,,
+2,2.0,左手側,,,,
+2,2.0,右手側,,,,
+3,3.0,左手側,,,,
+3,3.0,右手側,,,,
+4,4.0,左手側,,,,
+4,4.0,右手側,,,,
+5,5.0,左手側,,,,
+5,5.0,右手側,,,,
