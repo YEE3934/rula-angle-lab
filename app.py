@@ -16,13 +16,14 @@ import streamlit as st
 from angle_lab_core import (
     CAMERAS, PARTS, SIDES, SIDE_INDICES, candidates_from_landmarks,
     choose_candidate, evaluate_paired, make_template, parse_rows,
-    refine_relative_projection,
+    refine_relative_projection, refine_neck_cross_view_conflicts,
+    flag_shared_neck_conflicts,
 )
 
 st.set_page_config(page_title="RULA Angle Lab｜跨視角量角研究", page_icon="🔬", layout="wide")
 st.title("🔬 RULA Angle Lab｜跨視角角度測試")
-st.caption("獨立研究工具 v1.0｜同側前臂／頸部 2D 角度比較，不會修改正式 RULA 系統或自動更動 Grand Score")
-st.warning("這是測試版：視角品質門檻是尚待驗證的工程假設。候選視角 ≠ 真實 3D 關節角度；研究結果不可直接宣稱為官方 RULA 分數。", icon="⚠️")
+st.caption("獨立研究工具 v1.1｜側向運動平面檢查＋跨鏡頭角度衝突警示｜不會修改正式 RULA 的 Grand Score")
+st.warning("v1.1 重要修正：正面 Front 的前臂屈曲與頸部前屈**禁止自動選用**，即使關鍵點品質為 1.00 也一樣。側面初篩不等於真正確認運動平面；沒有合格來源就保留不確定，不自動修改正式 RULA 分數。", icon="⚠️")
 
 LABELS = {"Left": "左側鏡頭 Left", "Front": "正面鏡頭 Front", "Right": "右側鏡頭 Right"}
 
@@ -128,7 +129,10 @@ def make_zip(summary, detail, stats):
         z.writestr("analysis_summary.csv",to_csv_bytes(summary))
         z.writestr("all_camera_candidates.csv",to_csv_bytes(detail))
         z.writestr("paired_mae.csv",to_csv_bytes(stats))
-        z.writestr("READ_ME.txt", "RULA Angle Lab v1.0 research output\n"
+        z.writestr("READ_ME.txt", "RULA Angle Lab v1.1 research output\n"
+                   "Frontal 2D elbow and neck flexion are diagnostic ONLY, never eligible to replace a side view.\n"
+                   "Side orientation screen and 15-degree neck disagreement alarms are unvalidated research heuristics.\n"
+                   "An empty selected angle means NO VERIFIED CANDIDATE; it is NOT zero.\n"
                    "This is a preliminary camera view selection heuristic, not calibrated 3D nor official RULA score.\n"
                    "The chosen camera always tracks the SAME anatomical side; body_side is fixed.\n"
                    "Neck values are abs(180-angle(hip,shoulder,ear)) 2D proxy, not anatomical cervical flexion.\n"
@@ -142,7 +146,7 @@ def make_zip(summary, detail, stats):
 with st.expander("研究設計與角度定義（先看）", expanded=False):
     st.markdown("""**人體側別固定**：左手側永遠使用 MediaPipe 左肩 11、左肘 13、左腕 15；右手側使用 12、14、16。更換鏡頭不更換評估側。\n
 **前臂角度**：與正式程式一致，`abs(180-angle(肩,肘,腕))` 是屈曲代理角；同時保存肘內角供人工核對。**頸部角度**：沿用正式 `222.py` v11.4 的 `abs(180 - angle(髖, 肩, 耳))` 代理值，兩者都不是經校正的 3D 解剖真值。\n
-**跨視角門檻**：MediaPipe 可見度、肢段投影長度／比例、側視肩寬比。候選分數只是工程性品質指標，不能反推準確率。正面頸部前屈不自動取代側面。\n
+**v1.1 視角適用性**：可見度與關節幾何是「關鍵點品質」，另外獨立檢查「鏡頭是否適合量測該運動平面」。前臂屈曲和頸部前屈不允許 **Front 正面鏡頭**自動替代；左右側向鏡頭也需通過探索性的肩寬／軀幹比初篩（**仍不能證明實際屈曲運動平面**）。只有原視角不合格時，才列出另一個側面鏡頭作為**待驗證候選**。若頸角跨鏡頭／左右人體側別差異過大，停止自動選角並保留原始數據。\n
 **研究比較**：請填入獨立人工角度以及「正式 RULA 主系統輸出的原始角度」。只有同一筆樣本的三種角度均存在才納入成對 MAE；沒有真值的樣本保留為待補。""")
 
 st.subheader("① 上傳三支同期影片")
@@ -273,11 +277,15 @@ if st.button("🚀 執行跨視角角度比較",type="primary",disabled=run_disa
         st.exception(exc)
         st.error("分析未完成；保留正式 RULA 系統不受影響。建議先測試單一時間點及較小影片。")
     else:
-        st.session_state["lab_result"]={"summary":pd.DataFrame(scan_rows),
+        final_summary=flag_shared_neck_conflicts(pd.DataFrame(scan_rows))
+        st.session_state["lab_result"]={"summary":final_summary,
             "details":pd.DataFrame(scan_details),"landmarks":cache,
             "offsets":dict(offsets),"mirrors":dict(mirrors),
             "signatures":{cam:_fingerprint(uploads[cam]) for cam in CAMERAS}}
-        st.success(f"分析完成：{len(scan_rows)} 筆側別 × 2個部位，提供三鏡頭角度候選。")
+        conflict_count=int(final_summary["neck_shared_conflict"].sum())
+        st.success(f"分析完成：{len(scan_rows)} 筆側別 × 2個部位；正面前臂／頸部不會被自動選用。")
+        if conflict_count:
+            st.warning(f"發現 {conflict_count} 筆人體側別的頸部跨側分歧（同一時間、同一樣本左右兩側），已將候選頸角標記待複核；原始角度仍保留在匯出結果。")
     finally:
         for cap in captures.values():cap.release()
 
@@ -312,7 +320,10 @@ if "lab_result" in st.session_state:
                     matched=details[(details["sample_id"]==row["sample_id"]) & (details["body_side"]==side) & (details["part"]==part) & (details["camera"]==cam)]
                     if not matched.empty:
                         item=matched.iloc[0]
-                        st.caption(f"{part}：{item['angle_deg'] if np.isfinite(item['angle_deg']) else '無效'}°｜品質 {item['quality']:.2f}｜{'候選通過' if item['eligible'] else '不採用'}")
+                        angle_text=f"{item['angle_deg']:.2f}°" if np.isfinite(item['angle_deg']) else "無效"
+                        st.caption(f"{part}：{angle_text}｜關鍵點品質 {item['quality']:.2f}｜視角：{item['view_status']}｜{'研究候選通過' if item['eligible'] else '不推薦取代'}")
+                        if not item['eligible']:
+                            st.caption(f"原因：{item['warnings']}")
                         if part=="頸部" and np.isfinite(item.get("neck_legacy_proxy_deg",np.nan)):
                             st.caption(f"舊版眼耳＋軀幹中心線代理角 {item['neck_legacy_proxy_deg']:.1f}°（只供研究對照）")
                         if part=="前臂" and np.isfinite(item.get("interior_angle_deg",np.nan)):
@@ -320,12 +331,14 @@ if "lab_result" in st.session_state:
         st.caption("骨架點是模型估測座標；同一個人體側別在不同鏡頭會有不同2D投影，且不保證任何一個是3D真值。")
     with tabs[1]:
         showcols=["sample_id","time_sec","body_side","lab_base_forearm_deg","selected_forearm_deg","source_forearm","decision_forearm",
-                  "lab_base_neck_deg","selected_neck_deg","source_neck","decision_neck"]
+                  "lab_base_neck_deg","selected_neck_deg","source_neck","decision_neck",
+                  "neck_opposite_side_gap_deg","neck_shared_conflict"]
         st.dataframe(summary[showcols],hide_index=True,use_container_width=True)
-        st.caption("頸部各鏡頭另提供『舊版眼耳＋軀幹中心線代理角』作為 C 方法的參考線診斷，但**不會自動拿舊版角替換正式分數**。")
+        st.caption("v1.1：**正面鏡頭即使品質 1.00，也不能作為前臂／頸部屈曲的自動替代來源**。所有鏡頭的原始角度依然保留供研究。頸部發生跨鏡頭或左右人體側別衝突時，候選角度留空（不是0度）。")
+        st.caption("顯示『研究候選：另一側鏡頭』仍只是未經3D校正的2D代理值，不是經驗證的自動更正；舊版頸部參考線也不自動取代正式角度。")
         with st.expander("各個鏡頭的完整品質診斷／所有候選角度"):
             st.dataframe(details,use_container_width=True,hide_index=True)
-        st.info("『研究候選：跨鏡頭』不等於自動正確，不應拿其他攝影機的人體右側角度替換左側。此頁僅提供可檢驗候選，不直接修改正式系統分數。")
+        st.info("攝影機 Left／Right ≠ 人體左／右手。研究候選永遠固定原人體評估側；若側面影像仍可能離平面或關鍵點錯誤，請人工確認。不直接修改正式系統分數。")
     with tabs[2]:
         st.write("在下表填上人工角度與**正式主系統原本輸出的角度**。若先前從 CSV 匯入，已經帶入；缺值維持空白，不能當0度。")
         definition=st.selectbox("你人工畫的前臂角度到底是哪種？（所有樣本必須同一規則）",
@@ -343,7 +356,7 @@ if "lab_result" in st.session_state:
         data["summary"]=summary
         stats=evaluate_paired(summary,forearm_manual_kind=manual_kind)
         st.dataframe(stats,hide_index=True,use_container_width=True)
-        st.caption("前臂人工定義："+definition+"。以上『原始MAE』使用你輸入的正式系統原始角度；『候選MAE』使用本實驗的視角候選。所有比較嚴格使用三者都有值的同一批紀錄，避免因排除高誤差影格而虛假改善。")
+        st.caption("前臂人工定義："+definition+"。以上『原始MAE』使用你輸入的正式系統原始角度；『候選MAE』使用本實驗的視角候選。比較嚴格使用三者都有值的同一批紀錄；**務必同時報告未選出候選的樣本數**，否則可能因排除困難影格而高估準確率。")
         if summary["manual_neck_deg"].notna().any() or summary["manual_forearm_deg"].notna().any():
             extra=[]
             for label,stem in (("頸部","neck"),("前臂","forearm")):
@@ -370,4 +383,4 @@ if "lab_result" in st.session_state:
         st.caption("ZIP 不包含影片與原始影像，只包含角度、選擇來源、品質診斷與成對 MAE。研究時請自行保存同時間戳對照照片。")
 
 st.divider()
-st.caption("RULA Angle Lab v1.0 | MediaPipe Legacy Pose (33 points) · Python · OpenCV · Streamlit | Independent research prototype")
+st.caption("RULA Angle Lab v1.1 | Front sagittal exclusion · side-view orientation screen · neck disagreement alarms | Independent research prototype")

@@ -74,7 +74,10 @@ def _candidate_base(camera: str, side: str, part: str) -> dict:
             "warnings": "", "projected_length_ratio": float("nan"),
             "shoulder_width_torso_ratio": float("nan"),
             "forearm_upper_ratio": float("nan"), "interior_angle_deg": float("nan"),
-            "neck_legacy_proxy_deg": float("nan"), "geometry_ok": False}
+            "neck_legacy_proxy_deg": float("nan"), "geometry_ok": False,
+            "view_applicable": False, "view_status": "未判定", "view_reason": "",
+            "cross_view_conflict": False, "relative_projection": float("nan"),
+            "shoulder_line_visibility": float("nan")}
 
 
 def candidates_from_landmarks(lm: dict[int, dict[str, float]] | None,
@@ -96,10 +99,39 @@ def candidates_from_landmarks(lm: dict[int, dict[str, float]] | None,
     shoulder_width_ratio = (float(np.linalg.norm(sh1[0]-sh2[0]))/torso
                             if sh1 is not None and sh2 is not None and math.isfinite(torso) and torso > 1 else float("nan"))
 
+    shoulder_line_vis = min(sh1[1], sh2[1]) if sh1 is not None and sh2 is not None else float("nan")
+    # This is a conservative camera-orientation screening proxy, NOT proof that an
+    # individual forearm/neck is moving inside the image plane.
+    # Treat unknown camera orientation as UNKNOWN, never silently as PASS.
+    if camera == "Front":
+        view_ok = False
+        view_status = "正面僅供診斷"
+        view_reason = "前臂屈伸與頸部前屈不得僅依正面2D投影自動替換；需經額外運動平面驗證"
+    elif not math.isfinite(shoulder_width_ratio) or not math.isfinite(shoulder_line_vis):
+        view_ok = False
+        view_status = "視角不明"
+        view_reason = "雙肩投影不足，無法排除軀幹旋轉或遮擋"
+    elif shoulder_line_vis < .35:
+        view_ok = False
+        view_status = "轉向證據不足"
+        view_reason = "其中一側肩點可見度太低，肩寬投影無法作為方向參考"
+    elif shoulder_width_ratio > .55:
+        view_ok = False
+        view_status = "疑似偏離正側面"
+        view_reason = f"肩寬／軀幹投影比 {shoulder_width_ratio:.2f} > 探索門檻0.55"
+    else:
+        view_ok = True
+        view_status = "側向初篩通過"
+        view_reason = "肩線投影較窄；仍無法單靠2D確認前臂／頸部真正運動平面"
+
     result = []
     for part in PARTS:
         c = _candidate_base(camera, side, part)
         c["shoulder_width_torso_ratio"] = shoulder_width_ratio
+        c["shoulder_line_visibility"] = round(shoulder_line_vis, 3) if math.isfinite(shoulder_line_vis) else float("nan")
+        c["view_applicable"] = view_ok
+        c["view_status"] = view_status
+        c["view_reason"] = view_reason
         if part == "前臂":
             names = ("shoulder", "elbow", "wrist")
         else:
@@ -131,9 +163,8 @@ def candidates_from_landmarks(lm: dict[int, dict[str, float]] | None,
                            math.isfinite(torso) and torso >= 20)
             if not geometry_ok:
                 warnings.append("肘腕投影短／肢段比例不合理，可能遮擋或離平面")
-            # Frontal view can be useful for some elbow motions, but not automatically reliable.
             if camera == "Front":
-                warnings.append("正面前臂夾角是否適合量測，需視動作平面判定")
+                warnings.append("正面前臂角只保留數值供觀察，不推薦為屈伸角度替代來源")
         else:
             c["neck_legacy_proxy_deg"] = legacy_neck_proxy(lm,width,height,side)
             head_len = float(np.linalg.norm(xyz[2]-xyz[1]))
@@ -143,74 +174,153 @@ def candidates_from_landmarks(lm: dict[int, dict[str, float]] | None,
             if not geometry_ok:
                 warnings.append("頸部參考線尺度／角度可疑")
             if camera == "Front":
-                warnings.append("正面影像不直接用於矢狀面頸部前屈角度替換")
-            elif math.isfinite(shoulder_width_ratio) and shoulder_width_ratio > .55:
-                warnings.append("肩寬投影大，側視鏡頭可能已非正側面")
+                warnings.append("正面耳肩髖角不直接用於矢狀面頸部前屈角度替換")
         c["geometry_ok"] = bool(geometry_ok)
+        # Landmark/segment quality is separate from movement-plane applicability.
+        # For example Front may have 0.997 landmark quality yet be rejected as
+        # a sagittal elbow/neck replacement.
         c["quality"] = round(0.65 * vis + (0.35 if geometry_ok else 0.0), 3)
-        c["eligible"] = bool(vis >= .55 and geometry_ok and math.isfinite(angle) and
-                             (part != "頸部" or (camera != "Front" and
-                              math.isfinite(shoulder_width_ratio) and shoulder_width_ratio <= .55)))
-        c["warnings"] = "；".join(warnings) if warnings else "通過初步幾何檢查；不代表實際角度準確"
+        c["eligible"] = bool(vis >= .55 and geometry_ok and math.isfinite(angle) and view_ok)
+        if not view_ok:
+            warnings.append(view_reason)
+        c["warnings"] = "；".join(warnings) if warnings else "關鍵點與側向初篩通過；不代表實際角度準確"
         result.append(c)
     return result
 
 
 def refine_relative_projection(candidates: list[dict]) -> list[dict]:
-    """Cross-camera projected-length heuristic; do not treat as ground-truth 3D."""
-    copied = [dict(c) for c in candidates]
+    """Only compare side-camera projections, never use a frontal length to veto a side view.
+
+    Relative length is a *warning* proxy. It cannot infer out-of-plane arm rotation
+    from a single camera. A questionable side image never becomes reliable merely
+    because the other camera also looks questionable.
+    """
+    copied = [dict(c, relative_projection=c.get("relative_projection", float("nan"))) for c in candidates]
     by_part_side = {(x["body_side"], x["part"]) for x in copied}
     for side, part in by_part_side:
         if part != "前臂":
             continue
         subset = [x for x in copied if x["body_side"] == side and x["part"] == part]
-        lengths = [x["projected_length_ratio"] for x in subset if math.isfinite(x["projected_length_ratio"]) and x["geometry_ok"]]
+        lengths = [x["projected_length_ratio"] for x in subset
+                   if x["camera"] in ("Left", "Right") and x["eligible"]
+                   and math.isfinite(x.get("projected_length_ratio", float("nan")))]
         if len(lengths) < 2 or max(lengths) <= .01:
             continue
         max_len = max(lengths)
         for x in subset:
-            ratio = x["projected_length_ratio"] / max_len if math.isfinite(x["projected_length_ratio"]) else float("nan")
+            if x["camera"] not in ("Left", "Right"):
+                continue
+            length=x.get("projected_length_ratio", float("nan"))
+            ratio = length / max_len if math.isfinite(length) else float("nan")
             x["relative_projection"] = round(ratio, 3) if math.isfinite(ratio) else float("nan")
             if math.isfinite(ratio) and ratio < .60:
                 x["eligible"] = False
-                x["quality"] = round(max(0.0, x["quality"] - .22), 3)
-                x["warnings"] += "；相對其他鏡頭前臂投影顯著縮短（僅啟發式）"
+                x["warnings"] += "；對另一合格側面鏡頭，前臂投影顯著縮短（僅探索性檢查）"
             elif math.isfinite(ratio) and ratio < .78:
-                x["quality"] = round(max(0.0, x["quality"] - .09), 3)
-                x["warnings"] += "；前臂投影偏短（留意）"
+                x["warnings"] += "；與另一側面相比前臂投影偏短（留意，不自動扣準確率）"
+    return copied
+
+
+def refine_neck_cross_view_conflicts(candidates: list[dict], threshold_deg: float = 15.0) -> list[dict]:
+    """Do not choose a 'winner' when two initially admissible side views disagree.
+
+    This is a conflict alarm, not proof that either view is inaccurate. The
+    ear/shoulder/hip proxy is inherently projection dependent.
+    """
+    if threshold_deg <= 0:
+        raise ValueError("threshold_deg must be positive")
+    copied=[dict(c) for c in candidates]
+    for side in SIDES:
+        possible=[c for c in copied if c["body_side"]==side and c["part"]=="頸部"
+                  and c["camera"] in ("Left", "Right") and c["eligible"]
+                  and math.isfinite(c["angle_deg"])]
+        if len(possible)!=2:
+            continue
+        gap=abs(possible[0]["angle_deg"]-possible[1]["angle_deg"])
+        if gap >= threshold_deg:
+            for c in possible:
+                c["eligible"]=False
+                c["cross_view_conflict"]=True
+                c["warnings"] += f"；兩側鏡頭對同一人體側別的頸角差 {gap:.1f}°，暫停自動選角"
     return copied
 
 
 def choose_candidate(candidates: list[dict], side: str, part: str) -> dict:
-    """Conservative RESEARCH recommendation; never substitutes a formal RULA angle."""
+    """Conservative research suggestion; frontal sagittal angle NEVER selected.
+
+    Keep valid original side camera even if another side camera has a higher
+    landmark-quality score. Other side camera is used only when original fails,
+    and always labeled as an unverified research candidate.
+    """
     base_cam = "Left" if side == "左手側" else "Right"
+    opposite_cam = "Right" if base_cam == "Left" else "Left"
     subset = [c for c in candidates if c["body_side"] == side and c["part"] == part]
     base = next((c for c in subset if c["camera"] == base_cam), None)
-    good = sorted([c for c in subset if c["eligible"]], key=lambda x: x["quality"], reverse=True)
-    choice = None
-    if base and base["eligible"]:
-        choice = base
-        if good and good[0]["camera"] != base_cam and good[0]["quality"] > base["quality"] + .12:
-            choice = good[0]
-    elif good:
-        choice = good[0]
-    state = "無合格視角"
-    caution = "三個鏡頭的品質條件均不充分；需人工評估或保留不確定"
+    alternative = next((c for c in subset if c["camera"] == opposite_cam), None)
+    valid = lambda c: (c is not None and c.get("eligible", False)
+                       and c.get("view_applicable", True)
+                       and math.isfinite(c.get("angle_deg", float("nan"))))
+    choice = base if valid(base) else (alternative if valid(alternative) else None)
+    state = "無合格側向視角"
+    caution = "兩側鏡頭未通過初步檢查或出現角度衝突；保持角度不確定，需人工或校正3D資料確認"
     if choice:
-        state = "維持原視角" if choice["camera"] == base_cam else "研究候選：跨鏡頭"
-        caution = "品質門檻為工程假設，仍須人工角度驗證；不能直接代入正式RULA"
+        state = "維持原側向視角" if choice["camera"] == base_cam else "研究候選：另一側鏡頭（待人工驗證）"
+        caution = "關鍵點品質與側向初篩通過；尚未證實前臂／頸部的實際運動平面，不是量測準確率"
+        if choice["camera"] != base_cam:
+            caution += "；原鏡頭不合格，改列另一側鏡頭的同一人體側別角度為研究候選，並非正式自動替換"
         if base is not None and math.isfinite(base["angle_deg"]) and choice["camera"] != base_cam:
             diff = abs(choice["angle_deg"] - base["angle_deg"])
             if diff >= 15:
-                caution += f"；與原視角差 {diff:.1f}°，建議人工檢查"
+                caution += f"；與原視角差 {diff:.1f}°，需人工檢查原影格"
         if part == "頸部":
-            caution += "；仍是耳肩髖2D代理角，非解剖學頸椎前屈真值"
+            caution += "；耳肩髖2D代理角不等於解剖頸椎前屈角"
+    elif any(c.get("cross_view_conflict") for c in subset):
+        state = "頸部跨鏡頭分歧（待複核）"
+        caution = "兩個初步合格側面鏡頭的頸角差超過探索門檻；不能靠可見度決定哪個正確"
     return {"body_side": side, "part": part, "baseline_camera": base_cam,
             "baseline_angle_deg": base["angle_deg"] if base else float("nan"),
             "selected_camera": choice["camera"] if choice else "無",
             "selected_angle_deg": choice["angle_deg"] if choice else float("nan"),
             "selected_quality": choice["quality"] if choice else float("nan"),
             "decision": state, "decision_note": caution}
+
+
+def flag_shared_neck_conflicts(summary: pd.DataFrame, threshold_deg: float=15.0) -> pd.DataFrame:
+    """Flag opposite anatomical sides at the same time if neck proxies diverge.
+
+    Neck posture is shared but opposite ears and camera projections differ.
+    Do NOT average the two or decide which angle is correct from this test.
+    """
+    result=summary.copy()
+    result["neck_opposite_side_gap_deg"]=np.nan
+    result["neck_shared_conflict"]=False
+    result["neck_before_shared_check_deg"]=result["selected_neck_deg"].copy()
+    result["neck_source_before_shared_check"]=result["source_neck"].copy()
+    if result.empty:
+        return result
+    result["_time_key"]=pd.to_numeric(result["time_sec"],errors="coerce").round(4)
+    for (_, _), grp in result.groupby(["sample_id","_time_key"], dropna=False):
+        sides=set(grp["body_side"])
+        if not set(SIDES).issubset(sides):
+            continue
+        la=grp[grp["body_side"]=="左手側"].iloc[0]
+        ra=grp[grp["body_side"]=="右手側"].iloc[0]
+        left=float(la["lab_base_neck_deg"])
+        right=float(ra["lab_base_neck_deg"])
+        if not (math.isfinite(left) and math.isfinite(right)):
+            continue
+        gap=abs(left-right)
+        result.loc[grp.index,"neck_opposite_side_gap_deg"]=round(gap,2)
+        if gap >= threshold_deg:
+            result.loc[grp.index,"neck_shared_conflict"]=True
+            result.loc[grp.index,"selected_neck_deg"]=np.nan
+            result.loc[grp.index,"source_neck"]="無（跨側分歧）"
+            result.loc[grp.index,"quality_neck"]=np.nan
+            result.loc[grp.index,"decision_neck"]="頸部左右側分歧（待複核）"
+            result.loc[grp.index,"reason_neck"]=(
+                f"同時間左／右側基準頸部代理角相差 {gap:.1f}°（探索警戒值{threshold_deg:.0f}°）；"
+                "各側耳肩髖投影可能不同，必須確認同步、轉向、關鍵點及角度基準；不採用任一候選")
+    return result.drop(columns="_time_key")
 
 
 def evaluate_paired(df: pd.DataFrame, forearm_manual_kind: str = "flexion") -> pd.DataFrame:
