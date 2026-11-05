@@ -1,6 +1,0 @@
-[server]
-maxUploadSize = 200
-headless = true
-[theme]
-base = "dark"
-primaryColor = "#22B8A6"
